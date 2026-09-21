@@ -18,11 +18,11 @@ local HOST_NAME = ""
 local ROLE = nil
 JARVIS_KX_ADMIN_ENABLED = true
 local PREFIX = "'"
-local CMD_PREFIX = "'""
+local CMD_PREFIX = "'"
 
 -- JARVIS LOCAL OWNER CONFIG (Volt workspace)
 -- Saved locally on this PC in Volt's workspace and reused on future executions.
-(function()
+;(function()
     local ENV = getgenv()
     local FOLDER = "JARVIS"
     local FILE = FOLDER .. "/owner.txt"
@@ -226,6 +226,7 @@ local SLOT_MAP = {
 local masterLower = ""
 local IS_LEADER = false
 local extraOwners = {}
+local sharedAccessLevel = {}
 local revokedOwners = {}
 JARVIS_WHITELIST = JARVIS_WHITELIST or {
 }
@@ -343,6 +344,7 @@ local function buildPersistentState()
         hostName = HOST_NAME,
         whitelist = JARVIS_WHITELIST,
         extraOwners = extraOwners,
+        sharedAccessLevel = sharedAccessLevel,
         revokedOwners = revokedOwners,
         followDistance = followDistance,
         sideDistance = sideDistance,
@@ -379,6 +381,11 @@ local function savePersistentState(force)
     return ok == true
 end
 local function loadPersistentState()
+-- Protection is session-only. Never resume it after execute/rejoin.
+protecting = false
+protectedPlayer = nil
+targetPlayer = nil
+
     if persistentLoaded or not persistentCanUse() then
         return false
     end
@@ -418,6 +425,14 @@ local function loadPersistentState()
         for name, enabled in pairs(data.extraOwners) do
             if type(name) == "string" and enabled == true then
                 extraOwners[name:lower()] = true
+            end
+        end
+    end
+    if type(data.sharedAccessLevel) == "table" then
+        table.clear(sharedAccessLevel)
+        for name, level in pairs(data.sharedAccessLevel) do
+            if type(name) == "string" and (level == 1 or level == 2) then
+                sharedAccessLevel[name:lower()] = level
             end
         end
     end
@@ -655,6 +670,9 @@ local LOCAL = {
     park = true,
     unpark = true,
     spin = true,
+    unheadsit = true,
+    headsit = true,
+    unbounce = true,
     unspin = true,
     cmd = true,
     cmds = true,
@@ -665,6 +683,8 @@ local LOCAL = {
     punchaura = true,
     pa = true,
     share = true,
+    share1 = true,
+    share2 = true,
     unshare = true,
     owners = true,
     whitelist = true,
@@ -752,6 +772,28 @@ local ADMIN = {
     bring = true,
     antifling = true,
 }
+-- Commands available to users granted access with 'share.
+-- Destructive/admin escalation commands such as fling remain owner-only.
+-- SHARE LEVELS
+-- share1: broad access to normal JARVIS commands, but no fling/carfling.
+-- share2: basic harmless commands only.
+JARVIS_SHARE2_ALLOWED_COMMANDS = {
+    spin=true, unspin=true, bounce=true, unbounce=true, headsit=true, unheadsit=true, dance=true,
+    cmds=true, help=true, commands=true, cmdlist=true,
+    follow=true, stop=true, line=true,
+    nearest=true, untarget=true, where=true, coords=true,
+    left=true, center=true, right=true, front=true, behind=true,
+    above=true, below=true,
+    view=true, unview=true,
+    orbit=true, unorbit=true,
+    dance=true, cheer=true, laugh=true, point=true,
+    status=true, report=true, settings=true,
+}
+
+JARVIS_SHARE1_BLOCKED_COMMANDS = {
+    fling=true, carfling=true,
+}
+
 local COMMAND_HELP = {
     {
         "CORE  follow line stop fly protect punchaura invis vis hide unhide share shut cmds",
@@ -2898,10 +2940,12 @@ function announceCmds(targetPlayer)
             )
             if general and general:IsA("TextChannel") then
                 pcall(function()
-                    general:SendAsync("/w @" .. target.Name)
+                    -- Include a tiny seed message so Roblox actually creates
+                    -- the whisper channel on the very first 'cmds invocation.
+                    general:SendAsync("/w @" .. target.Name .. " .")
                 end)
             end
-            local deadline = os.clock() + 3
+            local deadline = os.clock() + 5
             repeat
                 task.wait(0.10)
                 whisper = getJarvisWhisperChannel(target)
@@ -3527,6 +3571,11 @@ function attachJarvisSelfDamageWatcher()
             end)
         end)
 end
+
+-- Defensive modes stay enabled until explicitly turned off.
+-- IMPORTANT: AntiPunch must NOT select arbitrary nearby players.
+-- A response is only allowed after the existing damage/punch detector identifies
+-- a specific attacker and calls startJarvisAntiPunch(attacker).
 function disconnectProtectDamageWatcher()
     if JARVIS_PROTECT_DAMAGE_CONNECTION then
         pcall(function()
@@ -3735,6 +3784,231 @@ function attachProtectDamageWatcher(target)
             end
         end)
 end
+
+-- SHOT -> .kill TARGET
+-- Uses the same HealthChanged idea as Protect, but only acts after this client
+-- has just fired while holding a Tool. It then chooses the damaged player that
+-- was most plausibly in the shot direction and sends the normal admin .kill.
+;(function()
+    local env = getgenv()
+    env.JARVIS_SHOTKILL_ENABLED = true
+    env.JARVIS_SHOTKILL_WINDOW = 0.75
+    env.JARVIS_SHOTKILL_MAX_RANGE = 500
+    env.JARVIS_SHOTKILL_LAST_SHOT = 0
+    env.JARVIS_SHOTKILL_CONNECTIONS = env.JARVIS_SHOTKILL_CONNECTIONS or {}
+
+    local function clearPlayer(player)
+        local old = env.JARVIS_SHOTKILL_CONNECTIONS[player]
+        if old then
+            for _, connection in ipairs(old) do
+                pcall(function() connection:Disconnect() end)
+            end
+        end
+        env.JARVIS_SHOTKILL_CONNECTIONS[player] = nil
+    end
+
+    local function holdingGunLikeTool()
+        local char = bot.Character
+        if not char then return false end
+        local tool = char:FindFirstChildOfClass("Tool")
+        if not tool then return false end
+        -- Generic on purpose: you said you'll swap/limit the gun later.
+        return true
+    end
+
+    local function plausibleShotVictim(player)
+        if player == bot or not player.Character then
+            return false
+        end
+        local camera = workspace.CurrentCamera
+        local root = rootOf(player)
+        if not camera or not root then
+            return false
+        end
+
+        local delta = root.Position - camera.CFrame.Position
+        local distance = delta.Magnitude
+        if distance <= 0.01 or distance > env.JARVIS_SHOTKILL_MAX_RANGE then
+            return false
+        end
+
+        -- Require the victim to be reasonably close to the direction the
+        -- shooter was looking when the shot was fired.
+        local dot = camera.CFrame.LookVector:Dot(delta.Unit)
+        if dot < 0.94 then
+            return false
+        end
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = bot.Character and {bot.Character} or {}
+        params.IgnoreWater = true
+
+        local hit = workspace:Raycast(
+            camera.CFrame.Position,
+            delta,
+            params
+        )
+
+        return not hit
+            or (hit.Instance and hit.Instance:IsDescendantOf(player.Character))
+    end
+
+    local function onDamaged(player, oldHealth, newHealth)
+        if not env.JARVIS_SHOTKILL_ENABLED then return end
+        if not oldHealth or newHealth >= oldHealth then return end
+        if os.clock() - env.JARVIS_SHOTKILL_LAST_SHOT > env.JARVIS_SHOTKILL_WINDOW then
+            return
+        end
+        if not plausibleShotVictim(player) then
+            return
+        end
+
+        -- Consume this shot so one click cannot trigger several victims.
+        env.JARVIS_SHOTKILL_LAST_SHOT = 0
+        print("[JARVIS] shot target -> .kill", player.Name)
+        otherCmd("kill " .. player.Name)
+    end
+
+    local function watchCharacter(player, character)
+        clearPlayer(player)
+        local connections = {}
+        env.JARVIS_SHOTKILL_CONNECTIONS[player] = connections
+
+        local hum = character:FindFirstChildOfClass("Humanoid")
+            or character:WaitForChild("Humanoid", 8)
+        if not hum then return end
+
+        local lastHealth = hum.Health
+        table.insert(connections, hum.HealthChanged:Connect(function(newHealth)
+            local oldHealth = lastHealth
+            lastHealth = newHealth
+            onDamaged(player, oldHealth, newHealth)
+        end))
+    end
+
+    local function watchPlayer(player)
+        if player == bot then return end
+        if player.Character then
+            task.defer(watchCharacter, player, player.Character)
+        end
+        local list = env.JARVIS_SHOTKILL_CONNECTIONS[player] or {}
+        env.JARVIS_SHOTKILL_CONNECTIONS[player] = list
+        table.insert(list, player.CharacterAdded:Connect(function(character)
+            task.wait(0.15)
+            watchCharacter(player, character)
+        end))
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        watchPlayer(player)
+    end
+    Players.PlayerAdded:Connect(watchPlayer)
+    Players.PlayerRemoving:Connect(clearPlayer)
+
+    -- Record a shot only while a Tool is equipped.
+    UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            and holdingGunLikeTool()
+        then
+            env.JARVIS_SHOTKILL_LAST_SHOT = os.clock()
+        end
+    end)
+end)()
+
+
+-- CLIENT-ONLY GUN TARGET HOOK
+-- Left click while holding any Tool -> identify the player under the mouse.
+-- Replace/extend JARVIS_LOCAL_GUN_TARGET_CALLBACK for your own game's
+-- authorized weapon/admin handling.
+;(function()
+    local env = getgenv()
+
+    env.JARVIS_LOCAL_GUN_TARGET_ENABLED = true
+
+    if type(env.JARVIS_LOCAL_GUN_TARGET_CALLBACK) ~= "function" then
+        env.JARVIS_LOCAL_GUN_TARGET_CALLBACK = function(targetPlayer)
+            print("[JARVIS] local gun target:", targetPlayer.Name)
+        end
+    end
+
+    local function equippedTool()
+        local character = bot.Character
+        return character and character:FindFirstChildOfClass("Tool")
+    end
+
+    local function playerFromPart(part)
+        if not part then return nil end
+
+        local model = part:FindFirstAncestorOfClass("Model")
+        while model do
+            local player = Players:GetPlayerFromCharacter(model)
+            if player then
+                return player
+            end
+            model = model.Parent and model.Parent:FindFirstAncestorOfClass("Model")
+        end
+
+        return nil
+    end
+
+    local function targetUnderMouse()
+        local mouse = bot:GetMouse()
+        local target = mouse and mouse.Target
+        local player = playerFromPart(target)
+
+        if player and player ~= bot then
+            return player
+        end
+
+        -- Fallback: client camera ray through current mouse position.
+        local camera = workspace.CurrentCamera
+        if not camera then return nil end
+
+        local pos = UserInputService:GetMouseLocation()
+        local ray = camera:ViewportPointToRay(pos.X, pos.Y)
+
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances =
+            bot.Character and {bot.Character} or {}
+        params.IgnoreWater = true
+
+        local result = workspace:Raycast(
+            ray.Origin,
+            ray.Direction * 1000,
+            params
+        )
+
+        return result and playerFromPart(result.Instance) or nil
+    end
+
+    UserInputService.InputBegan:Connect(function(input, processed)
+        if processed or not env.JARVIS_LOCAL_GUN_TARGET_ENABLED then
+            return
+        end
+
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+            return
+        end
+
+        if not equippedTool() then
+            return
+        end
+
+        local targetPlayer = targetUnderMouse()
+        if not targetPlayer then
+            return
+        end
+
+        local callback = env.JARVIS_LOCAL_GUN_TARGET_CALLBACK
+        if type(callback) == "function" then
+            task.spawn(callback, targetPlayer)
+        end
+    end)
+end)()
+
 function jarvisWhitelistName(name)
     return tostring(name or ""):lower()
 end
@@ -4540,6 +4814,12 @@ function handle(body, fromName)
     rest = rest or ""
     local speaker =
         findPlayer(fromName)
+    if getgenv().JARVIS_ACTION_COMMAND
+        and getgenv().JARVIS_ACTION_COMMAND(cmd, rest)
+    then
+        return
+    end
+
     if cmd == "kx" then
         if tostring(fromName or ""):lower() ~= masterLower then
             voice("kx access denied.")
@@ -5136,26 +5416,24 @@ function handle(body, fromName)
         )
         return
     end
-    if cmd == "share" then
-        if fromName:lower()
-            ~= masterLower
-        then
+    if cmd == "share1" or cmd == "share2" or cmd == "share" then
+        if fromName:lower() ~= masterLower then
+            voice("access denied.")
             return
         end
-        local p =
-            findPlayer(
-                firstArg(rest)
-            )
+
+        local level = (cmd == "share2") and 2 or 1
+        local p = findPlayer(firstArg(rest))
         if p then
-            extraOwners[
-                p.Name:lower()
-            ] = true
-            revokedOwners[p.Name:lower()] = nil
-            voice(
-                "shared control with "
-                .. p.Name
-            )
+            local key = p.Name:lower()
+            extraOwners[key] = true
+            sharedAccessLevel[key] = level
+            revokedOwners[key] = nil
+            voice("shared access " .. tostring(level) .. " complete: " .. p.Name)
             refreshSlot()
+            savePersistentState(true)
+        else
+            voice("shared access " .. tostring(level) .. " incomplete: player not found.")
         end
         return
     end
@@ -5176,12 +5454,15 @@ function handle(body, fromName)
             extraOwners[
                 p.Name:lower()
             ] = nil
+            sharedAccessLevel[p.Name:lower()] = nil
         else
             extraOwners[
                 name:lower()
             ] = nil
+            sharedAccessLevel[name:lower()] = nil
         end
         refreshSlot()
+        savePersistentState(true)
         return
     end
     if cmd == "owners" then
@@ -6442,25 +6723,258 @@ RunService.Heartbeat:Connect(
         end
     end
 )
+
+;(function()
+    local env = getgenv()
+
+    env.JARVIS_SHARED_OWNER_PROTECTION = function(senderName, commandBody)
+        local senderKey = tostring(senderName or ""):lower()
+        if senderKey == masterLower or extraOwners[senderKey] ~= true then
+            return false
+        end
+
+        local body = tostring(commandBody or "")
+        local cmd, rest = body:match("^%s*(%S+)%s*(.-)%s*$")
+        cmd = tostring(cmd or ""):lower()
+        rest = tostring(rest or "")
+
+        -- Commands that can directly harm/force the owner are never allowed
+        -- from a shared account when the owner is the requested target.
+        local harmful = {
+            kill=true, k=true, loopkill=true, lk=true,
+            fling=true, carfling=true, bring=true,
+            hitbox=true, ragebot=true, silentaim=true,
+            toolaura=true, combo1=true, combo2=true, combo3=true,
+            m4a1=true, reming=true, ak=true, riot=true, mafia=true,
+        }
+
+        if not harmful[cmd] then
+            return false
+        end
+
+        local target = rest:match("^%s*(%S+)")
+        if not target or target == "" then
+            return false
+        end
+
+        local owner = Players:FindFirstChild(MASTER_NAME)
+        local targetPlayer = findPlayer(target)
+        local targetsOwner =
+            (owner and targetPlayer == owner)
+            or target:lower() == tostring(MASTER_NAME):lower()
+            or target:lower() == "owner"
+            or target:lower() == "master"
+
+        if not targetsOwner then
+            return false
+        end
+
+        extraOwners[senderKey] = nil
+        sharedAccessLevel[senderKey] = nil
+        revokedOwners[senderKey] = true
+        savePersistentState(true)
+        refreshSlot()
+        voice("access revoked: " .. tostring(senderName) .. " attempted to harm the owner.")
+        return true
+    end
+end)()
+
+
+;(function()
+    local env = getgenv()
+    env.JARVIS_ACTION_STATE = env.JARVIS_ACTION_STATE or {
+        spin = false,
+        spinSpeed = 8,
+        bounce = false,
+        bounceHeight = 2.5,
+        bounceSpeed = 4,
+        headSitTarget = nil,
+        danceTrack = nil,
+    }
+
+    local state = env.JARVIS_ACTION_STATE
+
+    local function stopDanceTrack()
+        if state.danceTrack then
+            pcall(function() state.danceTrack:Stop(0.15) end)
+            state.danceTrack = nil
+        end
+    end
+
+    env.JARVIS_ACTION_COMMAND = function(cmd, rest)
+        cmd = tostring(cmd or ""):lower()
+        rest = tostring(rest or "")
+
+        if cmd == "spin" then
+            state.spin = true
+            local n = tonumber(rest:match("[-+]?%d+%.?%d*"))
+            if n then state.spinSpeed = math.clamp(n, 0.5, 30) end
+            voice("spin enabled.")
+            return true
+        elseif cmd == "unspin" then
+            state.spin = false
+            voice("spin disabled.")
+            return true
+        elseif cmd == "bounce" then
+            state.bounce = true
+            voice("bounce enabled.")
+            return true
+        elseif cmd == "unbounce" then
+            state.bounce = false
+            voice("bounce disabled.")
+            return true
+        elseif cmd == "headsit" then
+            local name = rest:match("^%s*(%S+)")
+            local p = name and findPlayer(name)
+            if not p or p == bot then
+                voice("headsit target not found.")
+                return true
+            end
+            state.headSitTarget = p
+            voice("headsit tracking " .. p.Name .. ".")
+            return true
+        elseif cmd == "unheadsit" then
+            state.headSitTarget = nil
+            voice("headsit disabled.")
+            return true
+        elseif cmd == "dance" then
+            stopDanceTrack()
+            local char = bot.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local animator = hum and (hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum))
+            if animator then
+                local choice = tonumber(rest:match("%d+")) or 1
+                local ids = {
+                    [1] = "rbxassetid://507771019",
+                    [2] = "rbxassetid://507776043",
+                    [3] = "rbxassetid://507777268",
+                }
+                local anim = Instance.new("Animation")
+                anim.AnimationId = ids[math.clamp(choice,1,3)]
+                local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
+                anim:Destroy()
+                if ok and track then
+                    track.Looped = true
+                    track.Priority = Enum.AnimationPriority.Action
+                    track:Play(0.15)
+                    state.danceTrack = track
+                    voice("dance " .. tostring(choice) .. " enabled.")
+                end
+            end
+            return true
+        end
+        return false
+    end
+
+    RunService.Heartbeat:Connect(function()
+        local char = bot.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+
+        -- Apply spin AFTER movement/follow logic each frame so follow, orbit,
+        -- idle, etc. do not overwrite the rotation.
+        if state.spin then
+            root.CFrame = root.CFrame * CFrame.Angles(0, state.spinSpeed * (1/60), 0)
+        end
+
+        -- Bounce is an additive vertical motion and does not replace follow.
+        if state.bounce and not state.headSitTarget then
+            local y = math.sin(os.clock() * state.bounceSpeed) * state.bounceHeight
+            root.CFrame = root.CFrame + Vector3.new(0, math.max(0,y) * 0.08, 0)
+        end
+
+        -- Headsit: position above the target's head while preserving a normal
+        -- upright orientation. This is a local movement utility, not a fling.
+        local target = state.headSitTarget
+        if target then
+            local tc = target.Character
+            local head = tc and tc:FindFirstChild("Head")
+            if head then
+                local goal = head.CFrame * CFrame.new(0, 1.65, 0)
+                root.CFrame = CFrame.new(goal.Position) * CFrame.Angles(0, select(2, root.CFrame:ToEulerAnglesYXZ()), 0)
+                root.AssemblyLinearVelocity = Vector3.zero
+            else
+                state.headSitTarget = nil
+            end
+        end
+    end)
+end)()
+
 function onChat(sender, message)
     if IS_LEADER or not sender or not message then return end
     if sender:lower() == bot.Name:lower() then return end
 
     local text = tostring(message)
     local lower = text:lower()
-    local isHost = sender:lower() == masterLower
+    local senderLower = sender:lower()
+    local isHost = senderLower == masterLower
+    local isShared = extraOwners[senderLower] == true
+        and revokedOwners[senderLower] ~= true
+    local hasAccess = isHost or isShared
 
-    if isHost and lower:sub(1, #CMD_PREFIX) == CMD_PREFIX then
-        handle(text:sub(#CMD_PREFIX + 1), sender)
-        return
-    end
-
-    if lower:sub(1, #PREFIX) == PREFIX then
-        if not isHost then
+    -- Permanent owner AND users granted with 'share use the same apostrophe
+    -- prefix. Previously this branch checked only isHost, so shared users
+    -- could never reach handle().
+    if lower:sub(1, #CMD_PREFIX) == CMD_PREFIX then
+        if not hasAccess then
             voice("access denied.")
             return
         end
-        handle(text:sub(#PREFIX + 1), sender)
+
+        local body = text:sub(#CMD_PREFIX + 1)
+        if isShared and not isHost
+            and getgenv().JARVIS_SHARED_OWNER_PROTECTION
+            and getgenv().JARVIS_SHARED_OWNER_PROTECTION(sender, body)
+        then
+            return
+        end
+        if isShared and not isHost then
+            local sharedCmd = tostring(body):match("^%s*(%S+)")
+            sharedCmd = sharedCmd and sharedCmd:lower() or ""
+            local level = sharedAccessLevel[senderLower] or 2
+
+            if level == 1 then
+                -- Share1 has the full normal command surface.
+                -- Owner protection/revocation is enforced separately below.
+            elseif not JARVIS_SHARE2_ALLOWED_COMMANDS[sharedCmd] then
+                voice("access denied: share2 has basic access only.")
+                return
+            end
+        end
+
+        handle(body, sender)
+        return
+    end
+
+    -- Keep the secondary prefix path consistent with the same access table.
+    if lower:sub(1, #PREFIX) == PREFIX then
+        if not hasAccess then
+            voice("access denied.")
+            return
+        end
+
+        local body = text:sub(#PREFIX + 1)
+        if isShared and not isHost
+            and getgenv().JARVIS_SHARED_OWNER_PROTECTION
+            and getgenv().JARVIS_SHARED_OWNER_PROTECTION(sender, body)
+        then
+            return
+        end
+        if isShared and not isHost then
+            local sharedCmd = tostring(body):match("^%s*(%S+)")
+            sharedCmd = sharedCmd and sharedCmd:lower() or ""
+            local level = sharedAccessLevel[senderLower] or 2
+
+            if level == 1 then
+                -- Share1 has the full normal command surface.
+                -- Owner protection/revocation is enforced separately below.
+            elseif not JARVIS_SHARE2_ALLOWED_COMMANDS[sharedCmd] then
+                voice("access denied: share2 has basic access only.")
+                return
+            end
+        end
+
+        handle(body, sender)
     end
 end
 pcall(function()
