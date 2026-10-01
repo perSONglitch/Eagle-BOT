@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "github@codebuddy-plugins-official": true,
+    "lua-lsp@codebuddy-plugins-official": true
+  }
+}
