@@ -1,17 +1,4 @@
--- JARVIS + VXPE COMMAND LAYER MERGE
--- Architecture:
---   Owner/chat -> JARVIS -> F6-selected Vape V4 command TextBox
--- Press F6 while the real Vape V4 command TextBox is focused to connect JARVIS to it.
--- Load/initialize the modified Vape V4 ChatCommand bridge as required by the supplied VXPE layer.
---
---[[ VXPE COMMAND / COMMUNICATION LAYER
-This is the supplied standalone VXPE command-box script, isolated in its own scope.
-It owns the command UI/parser and exposes getgenv().VXPECommandDispatch.
-]]
-do
--- VXPE standalone command box (no JARVIS, no F6 admin textbox)
--- Load Night5449791 Vape first, with your modified ChatCommand bridge enabled.
--- .k <partial username>: original position -> Y=16 -> Y=166 after consecutive no-damage timeouts.
+
 local Players = game:GetService('Players')
 local RunService = game:GetService('RunService')
 local UIS = game:GetService('UserInputService')
